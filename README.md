@@ -9,8 +9,7 @@ This repository contains **only the contract and its tests**. It is not
 a product repository — no frontend, no wallet integration. Intended as a
 reusable primitive other GenLayer builders can study or build on.
 
-**Deployed instance:** `<fill in the exact address of the instance you
-tested in this session, e.g. 0x0C...daC4 — must match this exact source>`
+**Deployed instance:** `0x96E70825E4F4b3dB44E018Dd7e99433dBF458FFb`
 
 ---
 
