@@ -1,8 +1,8 @@
-# NexusSLA — Multi-Source Truth Oracle (Intelligent Contract)
+# NexusSLA Multi-Source Truth Oracle (Intelligent Contract)
 
 A standalone GenLayer Intelligent Contract that automates SLA penalty
 enforcement using independent, multi-source evidence and deterministic
-penalty computation — not a single self-reported status page, and not an
+penalty computation not a single self-reported status page, and not an
 LLM-decided payout amount.
 
 This repository contains **only the contract and its tests**. It is not
@@ -36,21 +36,21 @@ not report an incident there.
    lookup table.** The LLM only classifies what happened (major / minor
    / none); it never decides the payout amount.
 5. Claims the AI can't substantiate at quorum are recorded as
-   `DISMISSED` on-chain **without reverting the transaction** — an
+   `DISMISSED` on-chain **without reverting the transaction** an
    auditable record instead of a bare error, and the provider's bond
    stays untouched.
 6. The provider gets a dispute window before funds move. If the
-   dispute's own sources don't reach quorum, the penalty is zeroed —
+   dispute's own sources don't reach quorum, the penalty is zeroed
    ambiguity favors the provider in both directions, which is what makes
    an automated penalty defensible.
 
 ## Design decisions
 
-- **Hostname-exact domain validation**, not substring matching — a URL
+- **Hostname-exact domain validation**, not substring matching a URL
   like `evil.com/?x=status.example.com` is correctly rejected.
 - **Incident-ID deduplication** prevents the same outage being claimed
   twice.
-- **No two evidence URLs may resolve to the same domain** in one claim —
+- **No two evidence URLs may resolve to the same domain** in one claim
   closes the trivial bypass of linking the same page twice to fake
   "multiple sources."
 - **Payouts are always capped at the remaining bond**, and state is
@@ -58,7 +58,7 @@ not report an incident there.
   double-pay.
 - Array arguments (`evidence_urls_json`, `evidence_domains_json`, tier
   arrays) are **JSON-encoded strings**, parsed with `json.loads()`
-  inside the contract — GenVM's schema generation does not support
+  inside the contract GenVM's schema generation does not support
   native `list[...]` as a public method parameter type.
 
 ## Contract interface
