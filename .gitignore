@@ -1,0 +1,35 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Testing & Cache artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+*.metadata.json
+test_harness.py
+run_contract_tests.py
+
+# Editor & OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# AI, Agents & Assistant files
+*prompt*
+*promnt*
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.agents/
+.cursor/
