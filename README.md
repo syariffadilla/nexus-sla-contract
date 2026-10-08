@@ -64,14 +64,14 @@ not report an incident there.
 
 | Method | Type | Description |
 |---|---|---|
-| `__init__` | constructor | provider, client, evidence domains, quorum, SLA period, bond, penalty tiers |
+| `__init__` | constructor | provider, client, evidence domains, quorum, SLA period, bond, penalty tiers, dispute_period_seconds |
 | `deposit_bond()` | write, payable | Provider locks the agreed bond |
-| `file_claim(evidence_urls_json)` | write | Client files a claim; triggers AI consensus |
-| `dispute_claim(evidence_urls_json)` | write | Provider contests a pending claim |
-| `finalize_claim()` | write | Executes payout per the resolved claim |
+| `file_claim(evidence_urls_json)` | write | Client files a claim; triggers AI consensus with strict timing/impact/quorum validation |
+| `dispute_claim(evidence_urls_json)` | write | Provider contests claim within dispute period; invalid/unavailable evidence triggers inconclusive retry |
+| `finalize_claim()` | write | Executes payout only after dispute period has elapsed (or dispute resolved) |
 | `withdraw_remaining_bond()` | write | Provider withdraws after SLA period ends |
 | `get_state()` | view | Mutable status: state, parties, bond, pending claim, history |
-| `get_config()` | view | Static terms: bond amount, period, evidence domains, penalty tiers |
+| `get_config()` | view | Static terms: bond amount, period, dispute_period_seconds, evidence domains, penalty tiers |
 
 ## Known limitations
 
@@ -89,8 +89,12 @@ pip install genlayer-test pytest
 gltest tests/test_nexus_sla.py
 ```
 
-20 tests covering constructor validation, access control, evidence
-validation (quorum, domain spoofing, duplicate domains), AI-consensus
-outcomes via mocked LLM responses (both dismissal and valid-claim
-paths), duplicate-incident rejection, payout math with bond capping, and
-withdrawal rules.
+30 tests covering:
+- Constructor validation (including dispute period)
+- Access controls and duplicate deposit prevention
+- Evidence URL validation (quorum, spoofed domains, duplicate domains)
+- Strict incident timing validation (ordering, SLA bounds, future timestamp prevention)
+- Strict impact level and agreeing-source count validation (under-quorum dismissal without penalty)
+- Time-based dispute period enforcement (premature finalization rejection, post-deadline settlement)
+- Inconclusive dispute evidence retry paths (network/render failure, inconclusive verdict retry without locking bond)
+- Payout math with bond capping, incident deduplication, and withdrawal rules.

@@ -1,4 +1,4 @@
-# v0.3.0 - NexusSLA (Fair & Impartial AI Court)
+# v0.4.0 - NexusSLA (Fair & Impartial AI Court)
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 """
 NexusSLA: SLA Dispute Court & Reliability Enforcement.
@@ -22,6 +22,7 @@ class NexusSLA(gl.Contract):
     state: str
     tier_thresholds_json: str
     tier_penalties_json: str
+    dispute_period_seconds: u256
     claims_history_json: str
     pending_claim_json: str
 
@@ -36,12 +37,14 @@ class NexusSLA(gl.Contract):
         bond_amount: int,
         tier_uptime_thresholds_json: str,
         tier_penalty_json: str,
+        dispute_period_seconds: int = 86400,
     ):
         provider_addr = Address(provider)
         client_addr = Address(client)
         assert provider_addr != client_addr, "Provider dan client harus berbeda"
         assert bond_amount > 0, "Bond amount harus positif"
         assert end > start, "end harus setelah start"
+        assert dispute_period_seconds > 0, "dispute_period_seconds harus positif"
 
         domains = json.loads(evidence_domains_json)
         assert len(domains) >= 1, "Minimal 1 domain bukti terdaftar"
@@ -59,6 +62,7 @@ class NexusSLA(gl.Contract):
         self.state = "UNINITIALIZED"
         self.tier_thresholds_json = tier_uptime_thresholds_json
         self.tier_penalties_json = tier_penalty_json
+        self.dispute_period_seconds = u256(dispute_period_seconds)
         self.claims_history_json = "[]"
         self.pending_claim_json = "{}"
 
@@ -245,11 +249,15 @@ Respond ONLY with valid JSON (no markdown):
             return
 
         # KEPUTUSAN JURI AI: Jika bukti VALID dan ada insiden
-        incident_id = str(parsed.get("incident_id", "incident-unspecified"))
-        incident_start = int(parsed.get("start_time_unix", local_start))
-        incident_end = int(parsed.get("end_time_unix", local_start + 3600))
-        impact = str(parsed.get("impact", "major"))
-        sources_agreeing = int(parsed.get("sources_agreeing", local_quorum))
+        incident_id = str(parsed.get("incident_id", "")).strip()
+        incident_start = int(parsed.get("start_time_unix", 0))
+        incident_end = int(parsed.get("end_time_unix", 0))
+        impact = str(parsed.get("impact", "")).lower().strip()
+        sources_agreeing = int(parsed.get("sources_agreeing", 0))
+        current_time = int(gl.block.timestamp)
+
+        if not incident_id:
+            raise Exception("Incident ID tidak boleh kosong")
 
         # Cek apakah incident_id sudah pernah diajukan sebelumnya
         history = json.loads(self.claims_history_json)
@@ -257,14 +265,45 @@ Respond ONLY with valid JSON (no markdown):
             if c.get("incident_id") == incident_id:
                 raise Exception("Incident ID ini sudah pernah diproses sebelumnya")
 
+        # Validasi ketat waktu insiden (timing bounds)
+        if incident_start > incident_end:
+            raise Exception("Waktu mulai insiden tidak boleh setelah waktu selesai")
+        if incident_start < local_start:
+            raise Exception("Waktu insiden sebelum periode SLA dimulai")
+        if incident_end > local_end:
+            raise Exception("Waktu insiden setelah periode SLA berakhir")
+        if incident_start > current_time:
+            raise Exception("Waktu insiden tidak boleh di masa depan")
+
+        # Validasi ketat level impact
+        if impact not in ("major", "minor"):
+            raise Exception("Level impact tidak valid")
+
+        # Validasi ketat kuorum sumber yang setuju
+        if sources_agreeing < local_quorum or sources_agreeing > local_total_sources:
+            history.append({
+                "status": "DISMISSED",
+                "incident_id": incident_id,
+                "reason": f"Kuorum sumber tidak terpenuhi: {sources_agreeing}/{local_total_sources} setuju (dibutuhkan {local_quorum})",
+                "evidence_provided": local_urls,
+            })
+            self.claims_history_json = json.dumps(history)
+            return
+
         duration_minutes = max(1, (incident_end - incident_start) // 60)
         penalty_bps = self._compute_penalty_bps(duration_minutes, local_end - local_start)
         remaining_int = int(self.remaining_bond)
         payout = min(remaining_int, (remaining_int * penalty_bps) // 10000)
 
+        claim_filed_at = current_time
+        dispute_deadline = claim_filed_at + int(self.dispute_period_seconds)
+
         pending_data = {
             "incident_id": incident_id,
-            "filed_at": incident_start,
+            "filed_at": claim_filed_at,
+            "dispute_deadline": dispute_deadline,
+            "incident_start": incident_start,
+            "incident_end": incident_end,
             "impact": impact,
             "duration_minutes": duration_minutes,
             "penalty_bps": penalty_bps,
@@ -290,6 +329,13 @@ Respond ONLY with valid JSON (no markdown):
         if claim.get("disputed", False):
             raise Exception("Klaim sudah pernah didispute")
 
+        # Penegakan batas waktu periode dispute
+        current_time = int(gl.block.timestamp)
+        filed_at = int(claim.get("filed_at", 0))
+        dispute_deadline = filed_at + int(self.dispute_period_seconds)
+        if current_time > dispute_deadline:
+            raise Exception("Periode dispute telah berakhir")
+
         incident_id = str(claim.get("incident_id", ""))
         original_impact = str(claim.get("impact", ""))
         local_quorum = int(self.quorum_required)
@@ -298,12 +344,24 @@ Respond ONLY with valid JSON (no markdown):
 
         def re_check() -> str:
             contents = []
+            successful_fetches = 0
             for u in local_urls:
                 try:
                     page = gl.nondet.web.render(u, mode="text")
+                    if page and page.strip() and page != "(gagal mengambil konten)":
+                        successful_fetches += 1
                 except Exception:
                     page = "(gagal mengambil konten)"
                 contents.append(page[:5000])
+
+            # Bukti tidak tersedia jika tidak memenuhi kuorum fetch berhasil
+            if successful_fetches < local_quorum:
+                return json.dumps({
+                    "status": "INCONCLUSIVE",
+                    "upheld": False,
+                    "revised_impact": "none",
+                    "sources_agreeing": 0,
+                })
 
             sources_block = ""
             for idx, c in enumerate(contents):
@@ -317,14 +375,32 @@ Quorum required to uphold: at least {local_quorum} of {local_total_sources} sour
 COUNTER-EVIDENCE / STATUS PROOF:
 {sources_block}
 
-Do the sources prove that the incident was invalid, a false alarm, or already mitigated?
-Respond ONLY with JSON:
-{{"upheld": <bool>, "revised_impact": "<major|minor|none>", "sources_agreeing": <int>}}
+TASK:
+Determine if the counter-evidence conclusively proves whether the incident was valid or invalid:
+1. If sources clearly prove service was normal / false alarm / mitigated:
+   - "status": "DISMISSED"
+   - "upheld": false
+   - "revised_impact": "none"
+   - "sources_agreeing": count of confirming sources (>= {local_quorum})
+2. If sources confirm the outage occurred and incident is valid:
+   - "status": "UPHELD"
+   - "upheld": true
+   - "revised_impact": "major" or "minor"
+   - "sources_agreeing": count of confirming sources (>= {local_quorum})
+3. If evidence is ambiguous, incomplete, blank, unavailable, or insufficient:
+   - "status": "INCONCLUSIVE"
+   - "upheld": false
+   - "revised_impact": "none"
+   - "sources_agreeing": 0
+
+Respond ONLY with valid JSON:
+{{"status": "<UPHELD|DISMISSED|INCONCLUSIVE>", "upheld": <bool>, "revised_impact": "<major|minor|none>", "sources_agreeing": <int>}}
 """
             default_resp = json.dumps({
-                "upheld": True,
-                "revised_impact": original_impact,
-                "sources_agreeing": local_quorum,
+                "status": "INCONCLUSIVE",
+                "upheld": False,
+                "revised_impact": "none",
+                "sources_agreeing": 0,
             })
 
             try:
@@ -332,29 +408,48 @@ Respond ONLY with JSON:
                 if not res or not str(res).strip():
                     return default_resp
                 cleaned = self._clean_json_response(str(res))
-                json.loads(cleaned)
+                parsed_json = json.loads(cleaned)
+                if not isinstance(parsed_json, dict):
+                    return default_resp
                 return cleaned
             except Exception:
                 return default_resp
 
         raw = gl.eq_principle.prompt_comparative(
             re_check,
-            "Validators must agree EXACTLY on every field that drives settlement: "
-            "upheld (true/false), revised_impact, and sources_agreeing (same "
-            "integer count -- this is checked against quorum_required before "
-            "the payout is zeroed or kept). Minor wording differences in any "
-            "free-text explanation are fine; differences in any field above "
-            "are NOT equivalent results.",
+            "Validators must agree EXACTLY on whether status is UPHELD, DISMISSED, "
+            "or INCONCLUSIVE, upheld (true/false), revised_impact, and sources_agreeing.",
         )
         parsed = json.loads(raw)
 
-        claim["disputed"] = True
-        claim["impact"] = parsed.get("revised_impact", claim["impact"])
-        claim["sources_agreeing"] = int(parsed.get("sources_agreeing", 0))
+        status = str(parsed.get("status", "INCONCLUSIVE")).upper().strip()
+        if status == "INCONCLUSIVE" or not parsed.get("status"):
+            # Bukti tidak tersedia atau invalid -> inconclusive retry (tidak mengunci payout, revert agar bisa retry)
+            raise Exception("Bukti dispute tidak tersedia atau tidak konklusif; silakan coba lagi")
 
-        if not parsed.get("upheld", False) or claim["sources_agreeing"] < local_quorum:
+        revised_impact = str(parsed.get("revised_impact", "none")).lower().strip()
+        sources_agreeing = int(parsed.get("sources_agreeing", 0))
+
+        if revised_impact not in ("major", "minor", "none"):
+            raise Exception("Level revised_impact tidak valid")
+
+        if sources_agreeing < 0 or sources_agreeing > local_total_sources:
+            raise Exception("Jumlah sumber yang setuju tidak valid")
+
+        if status == "DISMISSED":
+            if sources_agreeing < local_quorum:
+                raise Exception("Kuorum sumber dispute tidak terpenuhi")
+            claim["disputed"] = True
+            claim["impact"] = "none"
+            claim["sources_agreeing"] = sources_agreeing
             claim["penalty_bps"] = 0
             claim["payout_amount"] = 0
+        elif status == "UPHELD":
+            if sources_agreeing < local_quorum:
+                raise Exception("Kuorum sumber dispute tidak terpenuhi")
+            claim["disputed"] = True
+            claim["impact"] = revised_impact if revised_impact != "none" else original_impact
+            claim["sources_agreeing"] = sources_agreeing
 
         self.pending_claim_json = json.dumps(claim)
         self.state = "DISPUTE_WINDOW"
@@ -365,6 +460,16 @@ Respond ONLY with JSON:
             raise Exception("Tidak ada klaim yang siap difinalisasi")
 
         claim = json.loads(self.pending_claim_json)
+        current_time = int(gl.block.timestamp)
+        filed_at = int(claim.get("filed_at", 0))
+        dispute_deadline = filed_at + int(self.dispute_period_seconds)
+
+        # Enforceable time-based dispute period:
+        # Jika belum didispute, finalize_claim WAJIB menunggu hingga dispute deadline berakhir
+        if not claim.get("disputed", False):
+            if current_time < dispute_deadline:
+                raise Exception("Periode dispute belum berakhir")
+
         payout = min(int(claim.get("payout_amount", 0)), int(self.remaining_bond))
 
         self.remaining_bond = u256(int(self.remaining_bond) - payout)
@@ -404,13 +509,11 @@ Respond ONLY with JSON:
 
     @gl.public.view
     def get_config(self) -> str:
-        """Static agreement terms, separate from get_state()'s mutable
-        status -- the frontend needs this for the SLA target, evidence
-        source list, and penalty tiers, none of which get_state() exposes."""
         return json.dumps({
             "bond_amount": int(self.bond_amount),
             "start": int(self.start),
             "end": int(self.end),
+            "dispute_period_seconds": int(self.dispute_period_seconds),
             "evidence_domains": json.loads(self.evidence_domains_json),
             "tier_uptime_thresholds_bps": json.loads(self.tier_thresholds_json),
             "tier_penalty_bps": json.loads(self.tier_penalties_json),
