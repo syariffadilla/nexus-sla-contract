@@ -31,9 +31,10 @@ BOND = 1_000_000_000_000_000_000  # 1 GEN, wei-scale
 TIER_THRESHOLDS = [9990, 9900, 9500]
 TIER_PENALTIES = [500, 1500, 4000]
 DISPUTE_PERIOD = 86400  # 24 hours
+CLAIM_WINDOW = 604800  # 7 days after SLA end
 
 
-def deploy_default(direct_deploy, provider, client, dispute_period=DISPUTE_PERIOD):
+def deploy_default(direct_deploy, provider, client, dispute_period=DISPUTE_PERIOD, claim_window=CLAIM_WINDOW):
     return direct_deploy(
         NexusSLA,
         args=[
@@ -47,6 +48,7 @@ def deploy_default(direct_deploy, provider, client, dispute_period=DISPUTE_PERIO
             json.dumps(TIER_THRESHOLDS),
             json.dumps(TIER_PENALTIES),
             dispute_period,
+            claim_window,
         ],
     )
 
@@ -54,6 +56,17 @@ def deploy_default(direct_deploy, provider, client, dispute_period=DISPUTE_PERIO
 def fund(direct_vm, contract, provider):
     with direct_vm.prank(provider):
         contract.deposit_bond(value=BOND)
+
+
+@pytest.fixture(autouse=True)
+def in_claim_window():
+    # Simulated clock set inside [END, END + CLAIM_WINDOW] so file_claim is accepted by default
+    orig_ts = gl.block.timestamp
+    gl.block.timestamp = END + 100
+    try:
+        yield
+    finally:
+        gl.block.timestamp = orig_ts
 
 
 # ---------------------------------------------------------------------
@@ -571,3 +584,208 @@ def test_only_provider_can_withdraw(direct_vm, direct_deploy, direct_alice, dire
     with direct_vm.prank(direct_bob):
         with direct_vm.expect_revert("Hanya provider yang boleh menarik sisa bond"):
             contract.withdraw_remaining_bond()
+
+
+# ---------------------------------------------------------------------
+# Claim window (filing) and withdrawal rules
+# ---------------------------------------------------------------------
+
+def test_file_claim_reverts_before_sla_end(direct_vm, direct_deploy, direct_alice, direct_bob):
+    contract = deploy_default(direct_deploy, direct_alice, direct_bob)
+    fund(direct_vm, contract, direct_alice)
+    direct_vm.mock_llm(r".*", VALID_INCIDENT_RESPONSE)
+    orig_ts = gl.block.timestamp
+    gl.block.timestamp = END - 1
+    try:
+        with direct_vm.prank(direct_bob):
+            with direct_vm.expect_revert("Periode SLA belum berakhir; klaim belum bisa diajukan"):
+                contract.file_claim(json.dumps([
+                    "https://status.example.com/history",
+                    "https://monitor.example-thirdparty.com/incidents",
+                ]))
+    finally:
+        gl.block.timestamp = orig_ts
+
+
+def test_file_claim_reverts_after_claim_window(direct_vm, direct_deploy, direct_alice, direct_bob):
+    contract = deploy_default(direct_deploy, direct_alice, direct_bob)
+    fund(direct_vm, contract, direct_alice)
+    direct_vm.mock_llm(r".*", VALID_INCIDENT_RESPONSE)
+    orig_ts = gl.block.timestamp
+    gl.block.timestamp = END + CLAIM_WINDOW + 1
+    try:
+        with direct_vm.prank(direct_bob):
+            with direct_vm.expect_revert("Claim window telah berakhir"):
+                contract.file_claim(json.dumps([
+                    "https://status.example.com/history",
+                    "https://monitor.example-thirdparty.com/incidents",
+                ]))
+    finally:
+        gl.block.timestamp = orig_ts
+
+
+def test_withdraw_blocked_during_claim_window(direct_vm, direct_deploy, direct_alice, direct_bob):
+    contract = deploy_default(direct_deploy, direct_alice, direct_bob)
+    fund(direct_vm, contract, direct_alice)
+    orig_ts = gl.block.timestamp
+    gl.block.timestamp = END + 100
+    try:
+        with direct_vm.prank(direct_alice):
+            with direct_vm.expect_revert("Claim window belum berakhir"):
+                contract.withdraw_remaining_bond()
+    finally:
+        gl.block.timestamp = orig_ts
+
+
+def test_withdraw_allowed_after_claim_window(direct_vm, direct_deploy, direct_alice, direct_bob):
+    contract = deploy_default(direct_deploy, direct_alice, direct_bob)
+    fund(direct_vm, contract, direct_alice)
+    orig_ts = gl.block.timestamp
+    gl.block.timestamp = END + CLAIM_WINDOW + 1
+    try:
+        with direct_vm.prank(direct_alice):
+            contract.withdraw_remaining_bond()
+        state = json.loads(contract.get_state())
+        assert state["state"] == "CLOSED"
+        assert state["remaining_bond"] == 0
+    finally:
+        gl.block.timestamp = orig_ts
+
+
+# ---------------------------------------------------------------------
+# Provider challenge deadline
+# ---------------------------------------------------------------------
+
+def test_finalize_reverts_after_dispute_before_challenge_deadline(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    contract = deploy_default(direct_deploy, direct_alice, direct_bob)
+    fund(direct_vm, contract, direct_alice)
+    direct_vm.mock_llm(r".*EVIDENCE SOURCES:.*", VALID_INCIDENT_RESPONSE)
+    with direct_vm.prank(direct_bob):
+        contract.file_claim(json.dumps([
+            "https://status.example.com/history",
+            "https://monitor.example-thirdparty.com/incidents",
+        ]))
+
+    # Provider dispute yang belum konklusif tidak boleh membuka jalan finalize lebih awal
+    direct_vm.mock_llm(r".*COUNTER-EVIDENCE.*", json.dumps({
+        "status": "UPHELD", "upheld": True, "revised_impact": "major", "sources_agreeing": QUORUM,
+    }))
+    with direct_vm.prank(direct_alice):
+        contract.dispute_claim(json.dumps([
+            "https://status.example.com/history",
+            "https://monitor.example-thirdparty.com/incidents",
+        ]))
+
+    with direct_vm.prank(direct_bob):
+        with direct_vm.expect_revert("Periode dispute belum berakhir"):
+            contract.finalize_claim()
+
+
+def test_finalize_reverts_for_disputed_claim_before_deadline(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    contract = deploy_default(direct_deploy, direct_alice, direct_bob)
+    fund(direct_vm, contract, direct_alice)
+    direct_vm.mock_llm(r".*EVIDENCE SOURCES:.*", VALID_INCIDENT_RESPONSE)
+    with direct_vm.prank(direct_bob):
+        contract.file_claim(json.dumps([
+            "https://status.example.com/history",
+            "https://monitor.example-thirdparty.com/incidents",
+        ]))
+
+    with direct_vm.prank(direct_bob):
+        with direct_vm.expect_revert("Periode dispute belum berakhir"):
+            contract.finalize_claim()
+
+
+# ---------------------------------------------------------------------
+# Adjudication JSON and tier validation
+# ---------------------------------------------------------------------
+
+def test_file_claim_dismissed_on_non_numeric_timestamp(direct_vm, direct_deploy, direct_alice, direct_bob):
+    contract = deploy_default(direct_deploy, direct_alice, direct_bob)
+    fund(direct_vm, contract, direct_alice)
+    direct_vm.mock_llm(r".*", json.dumps({
+        "consensus_reached": True, "incident_id": "bad-ts",
+        "start_time_unix": "not-a-number", "end_time_unix": START + 2000,
+        "impact": "major", "sources_agreeing": QUORUM,
+    }))
+    with direct_vm.prank(direct_bob):
+        with direct_vm.expect_revert("Format JSON adjudikasi tidak valid"):
+            contract.file_claim(json.dumps([
+                "https://status.example.com/history",
+                "https://monitor.example-thirdparty.com/incidents",
+            ]))
+
+
+def test_file_claim_reverts_on_non_positive_timestamp(direct_vm, direct_deploy, direct_alice, direct_bob):
+    contract = deploy_default(direct_deploy, direct_alice, direct_bob)
+    fund(direct_vm, contract, direct_alice)
+    direct_vm.mock_llm(r".*", json.dumps({
+        "consensus_reached": True, "incident_id": "zero-ts",
+        "start_time_unix": 0, "end_time_unix": START + 2000,
+        "impact": "major", "sources_agreeing": QUORUM,
+    }))
+    with direct_vm.prank(direct_bob):
+        with direct_vm.expect_revert("Timestamp insiden harus positif"):
+            contract.file_claim(json.dumps([
+                "https://status.example.com/history",
+                "https://monitor.example-thirdparty.com/incidents",
+            ]))
+
+
+def test_constructor_rejects_mismatched_tier_lengths(direct_vm, direct_deploy, direct_alice, direct_bob):
+    with direct_vm.expect_revert("Panjang array threshold dan penalty harus sama"):
+        direct_deploy(
+            NexusSLA,
+            args=[
+                direct_alice, direct_bob, json.dumps(EVIDENCE_DOMAINS), QUORUM, START, END, BOND,
+                json.dumps([9990, 9900]), json.dumps([500, 1500, 4000]), DISPUTE_PERIOD, CLAIM_WINDOW,
+            ],
+        )
+
+
+def test_constructor_rejects_unordered_thresholds(direct_vm, direct_deploy, direct_alice, direct_bob):
+    with direct_vm.expect_revert("Threshold harus strictly descending"):
+        direct_deploy(
+            NexusSLA,
+            args=[
+                direct_alice, direct_bob, json.dumps(EVIDENCE_DOMAINS), QUORUM, START, END, BOND,
+                json.dumps([9900, 9990, 9500]), json.dumps([500, 1500, 4000]), DISPUTE_PERIOD, CLAIM_WINDOW,
+            ],
+        )
+
+
+def test_constructor_rejects_out_of_range_penalty(direct_vm, direct_deploy, direct_alice, direct_bob):
+    with direct_vm.expect_revert("Penalty harus 0-10000 bps"):
+        direct_deploy(
+            NexusSLA,
+            args=[
+                direct_alice, direct_bob, json.dumps(EVIDENCE_DOMAINS), QUORUM, START, END, BOND,
+                json.dumps(TIER_THRESHOLDS), json.dumps([500, 1500, 20000]), DISPUTE_PERIOD, CLAIM_WINDOW,
+            ],
+        )
+
+
+def test_constructor_rejects_negative_penalty(direct_vm, direct_deploy, direct_alice, direct_bob):
+    with direct_vm.expect_revert("Penalty harus 0-10000 bps"):
+        direct_deploy(
+            NexusSLA,
+            args=[
+                direct_alice, direct_bob, json.dumps(EVIDENCE_DOMAINS), QUORUM, START, END, BOND,
+                json.dumps(TIER_THRESHOLDS), json.dumps([500, -1, 4000]), DISPUTE_PERIOD, CLAIM_WINDOW,
+            ],
+        )
+
+
+def test_constructor_rejects_empty_tiers(direct_vm, direct_deploy, direct_alice, direct_bob):
+    with direct_vm.expect_revert("Tier tidak boleh kosong"):
+        direct_deploy(
+            NexusSLA,
+            args=[
+                direct_alice, direct_bob, json.dumps(EVIDENCE_DOMAINS), QUORUM, START, END, BOND,
+                json.dumps([]), json.dumps([]), DISPUTE_PERIOD, CLAIM_WINDOW,
+            ],
+        )
