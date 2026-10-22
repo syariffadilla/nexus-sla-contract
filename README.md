@@ -55,6 +55,20 @@ not report an incident there.
 - **Payouts are always capped at the remaining bond**, and state is
   updated before any transfer call, so a failed or duplicate call can't
   double-pay.
+- **Claim window**: claims can only be filed from SLA `end` until
+  `end + claim_window_seconds` (default 7 days). Remaining bond can be
+  withdrawn only after that window closes, and only when no claim is
+  pending.
+- **Provider challenge deadline**: a claim can be finalized only after
+  `filed_at + dispute_period_seconds`, whether or not it was disputed.
+  Disputes are accepted only before that deadline.
+- **Adjudication JSON is validated before any state change**: timestamps
+  must be positive integers, ordered, inside the SLA period, and the
+  incident must have ended. A quorum shortfall is recorded as DISMISSED
+  without reverting.
+- **Tier arrays are validated in the constructor**: equal non-empty
+  lengths, integers in 0-10000, thresholds strictly descending. Penalty
+  lookup picks the most severe matching tier.
 - Array arguments (`evidence_urls_json`, `evidence_domains_json`, tier
   arrays) are **JSON-encoded strings**, parsed with `json.loads()`
   inside the contract GenVM's schema generation does not support
@@ -64,14 +78,14 @@ not report an incident there.
 
 | Method | Type | Description |
 |---|---|---|
-| `__init__` | constructor | provider, client, evidence domains, quorum, SLA period, bond, penalty tiers, dispute_period_seconds, claim_stake_amount, post_sla_claim_window_seconds |
+| `__init__` | constructor | provider, client, evidence domains, quorum, SLA period, bond, penalty tiers, dispute_period_seconds (default 86400), claim_window_seconds (default 604800) |
 | `deposit_bond()` | write, payable | Provider locks the agreed bond |
-| `file_claim(evidence_urls_json)` | write, payable | Client files a claim with anti-spam stake; triggers AI consensus with strict timing/impact/quorum validation within the post-SLA claim window |
-| `dispute_claim(evidence_urls_json)` | write | Provider contests claim within challenge deadline; invalid/unavailable evidence triggers inconclusive retry |
-| `finalize_claim()` | write | Executes payout only after dispute period has elapsed (or dispute resolved); slashes stake on dismissed dispute |
-| `withdraw_remaining_bond()` | write | Provider withdraws after SLA period AND post-SLA claim window have ended |
-| `get_state()` | view | Mutable status: state, parties, bond, claim_stake, pending claim, history |
-| `get_config()` | view | Static terms: bond amount, period, post-SLA claim window, dispute_period_seconds, evidence domains, penalty tiers |
+| `file_claim(evidence_urls_json)` | write | Client files a claim within the claim window (SLA end to end + claim_window); triggers AI consensus with strict timing/impact/quorum validation |
+| `dispute_claim(evidence_urls_json)` | write | Provider contests claim before the challenge deadline; invalid/unavailable evidence triggers inconclusive retry |
+| `finalize_claim()` | write | Executes payout only after the challenge deadline (`filed_at + dispute_period_seconds`), disputed or not |
+| `withdraw_remaining_bond()` | write | Provider withdraws after the claim window closes and no claim is pending |
+| `get_state()` | view | Mutable status: state, parties, bond, pending claim, history |
+| `get_config()` | view | Static terms: bond amount, period, dispute_period_seconds, claim_window_seconds, evidence domains, penalty tiers |
 
 ## Known limitations
 
@@ -89,8 +103,12 @@ pip install genlayer-test pytest
 gltest test_nexus_sla.py
 ```
 
-45+ tests covering:
-- Constructor validation (including dispute period, nonnegative bounds, and tier arrays)
+Test suite covers:
+- Constructor validation (including dispute period, claim window, and tier arrays: length, ordering, bounds)
+- Claim window: filing rejected before SLA end and after the window, withdrawal blocked during the window and allowed after it
+- Provider challenge deadline: finalize rejected after a dispute until the deadline
+- Adjudication JSON: non-numeric and non-positive timestamps rejected before settlement
+- Constructor validation (including dispute period)
 - Access controls and duplicate deposit prevention
 - Evidence URL validation (quorum, spoofed domains, duplicate domains)
 - Anti-spam client stake and slashing mechanisms
