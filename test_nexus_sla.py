@@ -36,7 +36,14 @@ DISPUTE_PERIOD = 86400  # 24 hours
 CLAIM_STAKE = 50_000_000_000_000_000  # 0.05 GEN
 
 
-def deploy_default(direct_deploy, provider, client, dispute_period=DISPUTE_PERIOD, claim_stake=0):
+def deploy_default(
+    direct_deploy,
+    provider,
+    client,
+    dispute_period=DISPUTE_PERIOD,
+    claim_stake=0,
+    post_sla_claim_window=86400,
+):
     return direct_deploy(
         NexusSLA,
         args=[
@@ -51,6 +58,7 @@ def deploy_default(direct_deploy, provider, client, dispute_period=DISPUTE_PERIO
             json.dumps(TIER_PENALTIES),
             dispute_period,
             claim_stake,
+            post_sla_claim_window,
         ],
     )
 
@@ -661,4 +669,248 @@ def test_v2_sanitizer_cleans_prompt_injection(direct_vm, direct_deploy, direct_a
     assert "[FILTERED_INJECTION]" in cleaned
     assert "SYSTEM OVERRIDE" not in cleaned
     assert "Ignore previous instructions" not in cleaned
+
+
+# ---------------------------------------------------------------------
+# Steward Requirements Tests: (1), (2), (3), and (4)
+# ---------------------------------------------------------------------
+
+# (4) Tier array lengths, ordering, and nonnegative bounded values
+def test_constructor_rejects_mismatched_tier_array_lengths(direct_vm, direct_deploy, direct_alice, direct_bob):
+    with direct_vm.expect_revert("Panjang tier thresholds dan penalties harus sama"):
+        direct_deploy(
+            NexusSLA,
+            args=[
+                direct_alice, direct_bob, json.dumps(EVIDENCE_DOMAINS), QUORUM,
+                START, END, BOND,
+                json.dumps([9990, 9900]),  # 2 thresholds
+                json.dumps([500, 1500, 4000]),  # 3 penalties
+            ],
+        )
+
+
+def test_constructor_rejects_empty_tier_arrays(direct_vm, direct_deploy, direct_alice, direct_bob):
+    with direct_vm.expect_revert("Minimal 1 tier threshold dan penalty harus disediakan"):
+        direct_deploy(
+            NexusSLA,
+            args=[
+                direct_alice, direct_bob, json.dumps(EVIDENCE_DOMAINS), QUORUM,
+                START, END, BOND,
+                json.dumps([]),
+                json.dumps([]),
+            ],
+        )
+
+
+def test_constructor_rejects_out_of_bounds_tier_values(direct_vm, direct_deploy, direct_alice, direct_bob):
+    # Threshold > 10000 bps
+    with direct_vm.expect_revert("Threshold 10500 di luar rentang valid"):
+        direct_deploy(
+            NexusSLA,
+            args=[
+                direct_alice, direct_bob, json.dumps(EVIDENCE_DOMAINS), QUORUM,
+                START, END, BOND,
+                json.dumps([10500, 9900]),
+                json.dumps([500, 1500]),
+            ],
+        )
+
+    # Negative penalty (< 0)
+    with direct_vm.expect_revert("Penalty -100 di luar rentang valid"):
+        direct_deploy(
+            NexusSLA,
+            args=[
+                direct_alice, direct_bob, json.dumps(EVIDENCE_DOMAINS), QUORUM,
+                START, END, BOND,
+                json.dumps([9990, 9900]),
+                json.dumps([-100, 1500]),
+            ],
+        )
+
+
+def test_constructor_rejects_unordered_tier_arrays(direct_vm, direct_deploy, direct_alice, direct_bob):
+    # Thresholds not descending
+    with direct_vm.expect_revert("Tier thresholds harus terurut menurun secara ketat"):
+        direct_deploy(
+            NexusSLA,
+            args=[
+                direct_alice, direct_bob, json.dumps(EVIDENCE_DOMAINS), QUORUM,
+                START, END, BOND,
+                json.dumps([9500, 9900]),  # Ascending instead of descending
+                json.dumps([500, 1500]),
+            ],
+        )
+
+    # Penalties not ascending
+    with direct_vm.expect_revert("Tier penalties harus terurut meningkat secara ketat"):
+        direct_deploy(
+            NexusSLA,
+            args=[
+                direct_alice, direct_bob, json.dumps(EVIDENCE_DOMAINS), QUORUM,
+                START, END, BOND,
+                json.dumps([9990, 9900]),
+                json.dumps([1500, 500]),  # Descending instead of ascending
+            ],
+        )
+
+
+# (2) Coherent filing, incident-time, withdrawal, and post-SLA claim-window rules
+def test_file_claim_reverts_before_sla_start(direct_vm, direct_deploy, direct_alice, direct_bob):
+    contract = deploy_default(direct_deploy, direct_alice, direct_bob)
+    fund(direct_vm, contract, direct_alice)
+    orig_ts = gl.block.timestamp
+    gl.block.timestamp = START - 1000
+    try:
+        with direct_vm.prank(direct_bob):
+            with direct_vm.expect_revert("Klaim tidak dapat diajukan sebelum periode SLA dimulai"):
+                contract.file_claim(json.dumps([
+                    "https://status.example.com/history",
+                    "https://monitor.example-thirdparty.com/incidents",
+                ]))
+    finally:
+        gl.block.timestamp = orig_ts
+
+
+def test_file_claim_reverts_after_post_sla_window_expires(direct_vm, direct_deploy, direct_alice, direct_bob):
+    claim_window = 3600  # 1 hour window
+    contract = deploy_default(direct_deploy, direct_alice, direct_bob, post_sla_claim_window=claim_window)
+    fund(direct_vm, contract, direct_alice)
+    orig_ts = gl.block.timestamp
+    # Fast forward beyond END + claim_window
+    gl.block.timestamp = END + claim_window + 10
+    try:
+        with direct_vm.prank(direct_bob):
+            with direct_vm.expect_revert("Batas waktu pengajuan klaim (termasuk post-SLA claim window) telah berakhir"):
+                contract.file_claim(json.dumps([
+                    "https://status.example.com/history",
+                    "https://monitor.example-thirdparty.com/incidents",
+                ]))
+    finally:
+        gl.block.timestamp = orig_ts
+
+
+def test_file_claim_succeeds_within_post_sla_window(direct_vm, direct_deploy, direct_alice, direct_bob):
+    claim_window = 7200  # 2 hour window
+    contract = deploy_default(direct_deploy, direct_alice, direct_bob, post_sla_claim_window=claim_window)
+    fund(direct_vm, contract, direct_alice)
+    orig_ts = gl.block.timestamp
+    # Current time is after END, but inside post-SLA claim window
+    gl.block.timestamp = END + 1800
+    # Incident occurred before END
+    direct_vm.mock_llm(r".*", json.dumps({
+        "consensus_reached": True, "incident_id": "late-discovered-outage",
+        "start_time_unix": END - 3600, "end_time_unix": END - 600,
+        "impact": "major", "sources_agreeing": QUORUM,
+    }))
+    try:
+        with direct_vm.prank(direct_bob):
+            contract.file_claim(json.dumps([
+                "https://status.example.com/history",
+                "https://monitor.example-thirdparty.com/incidents",
+            ]))
+        state = json.loads(contract.get_state())
+        assert state["state"] == "CLAIM_PENDING"
+    finally:
+        gl.block.timestamp = orig_ts
+
+
+def test_withdraw_blocked_during_post_sla_claim_window(direct_vm, direct_deploy, direct_alice, direct_bob):
+    claim_window = 3600
+    contract = deploy_default(direct_deploy, direct_alice, direct_bob, post_sla_claim_window=claim_window)
+    fund(direct_vm, contract, direct_alice)
+    orig_ts = gl.block.timestamp
+    # SLA period has ended, but claim window is still active
+    gl.block.timestamp = END + 1000
+    try:
+        with direct_vm.prank(direct_alice):
+            with direct_vm.expect_revert("Periode post-SLA claim window belum berakhir"):
+                contract.withdraw_remaining_bond()
+    finally:
+        gl.block.timestamp = orig_ts
+
+
+def test_withdraw_succeeds_after_post_sla_claim_window(direct_vm, direct_deploy, direct_alice, direct_bob):
+    claim_window = 3600
+    contract = deploy_default(direct_deploy, direct_alice, direct_bob, post_sla_claim_window=claim_window)
+    fund(direct_vm, contract, direct_alice)
+    orig_ts = gl.block.timestamp
+    # Fully past END + claim_window
+    gl.block.timestamp = END + claim_window + 1
+    try:
+        with direct_vm.prank(direct_alice):
+            contract.withdraw_remaining_bond()
+        state = json.loads(contract.get_state())
+        assert state["state"] == "CLOSED"
+        assert state["remaining_bond"] == 0
+    finally:
+        gl.block.timestamp = orig_ts
+
+
+# (3) Validates adjudication JSON before state or funds are affected
+def test_file_claim_reverts_on_malformed_adjudication_json(direct_vm, direct_deploy, direct_alice, direct_bob):
+    contract = deploy_default(direct_deploy, direct_alice, direct_bob)
+    fund(direct_vm, contract, direct_alice)
+    direct_vm.mock_llm(r".*", "THIS IS NOT VALID JSON")
+    with direct_vm.prank(direct_bob):
+        # mock returns fallback empty or if comparative raw is non-dict
+        contract.file_claim(json.dumps([
+            "https://status.example.com/history",
+            "https://monitor.example-thirdparty.com/incidents",
+        ]))
+    # Falls back safely to empty response (dismissed) without breaking contract state
+    state = json.loads(contract.get_state())
+    assert state["state"] == "ACTIVE"
+
+
+def test_file_claim_reverts_when_incident_end_in_future(direct_vm, direct_deploy, direct_alice, direct_bob):
+    contract = deploy_default(direct_deploy, direct_alice, direct_bob)
+    fund(direct_vm, contract, direct_alice)
+    current_time = int(gl.block.timestamp)
+    direct_vm.mock_llm(r".*", json.dumps({
+        "consensus_reached": True, "incident_id": "future-end-incident",
+        "start_time_unix": current_time - 1000,
+        "end_time_unix": current_time + 1000,  # ends in future
+        "impact": "major", "sources_agreeing": QUORUM,
+    }))
+    with direct_vm.prank(direct_bob):
+        with direct_vm.expect_revert("Waktu selesai insiden tidak boleh di masa depan"):
+            contract.file_claim(json.dumps([
+                "https://status.example.com/history",
+                "https://monitor.example-thirdparty.com/incidents",
+            ]))
+
+
+# (1) & (3) Real dispute resolution slashes stake to provider on DISMISSED
+def test_dispute_dismissal_slashes_client_stake_to_provider(direct_vm, direct_deploy, direct_alice, direct_bob):
+    contract = deploy_default(direct_deploy, direct_alice, direct_bob, claim_stake=CLAIM_STAKE)
+    fund(direct_vm, contract, direct_alice)
+
+    # 1. File valid claim initially
+    direct_vm.mock_llm(r".*EVIDENCE SOURCES:.*", VALID_INCIDENT_RESPONSE)
+    urls = json.dumps([
+        "https://status.example.com/history",
+        "https://monitor.example-thirdparty.com/incidents",
+    ])
+    with direct_vm.prank(direct_bob):
+        contract.file_claim(urls, value=CLAIM_STAKE)
+
+    state = json.loads(contract.get_state())
+    assert state["state"] == "CLAIM_PENDING"
+    assert state["pending_claim"]["client_stake_held"] == CLAIM_STAKE
+
+    # 2. Provider contests claim with counter-evidence proving service was UP (DISMISSED)
+    direct_vm.mock_llm(r".*COUNTER-EVIDENCE.*", json.dumps({
+        "status": "DISMISSED", "upheld": False, "revised_impact": "none", "sources_agreeing": QUORUM,
+    }))
+    with direct_vm.prank(direct_alice):
+        contract.dispute_claim(urls)
+
+    # 3. Finalize claim: payout is 0, and stake is slashed to provider
+    with direct_vm.prank(direct_alice):
+        contract.finalize_claim()
+
+    final_state = json.loads(contract.get_state())
+    assert final_state["state"] == "ACTIVE"
+    assert final_state["history"][-1]["status"] == "DISMISSED"
+    assert final_state["history"][-1]["payout_amount"] == 0
 

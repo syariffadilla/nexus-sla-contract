@@ -64,14 +64,14 @@ not report an incident there.
 
 | Method | Type | Description |
 |---|---|---|
-| `__init__` | constructor | provider, client, evidence domains, quorum, SLA period, bond, penalty tiers, dispute_period_seconds |
+| `__init__` | constructor | provider, client, evidence domains, quorum, SLA period, bond, penalty tiers, dispute_period_seconds, claim_stake_amount, post_sla_claim_window_seconds |
 | `deposit_bond()` | write, payable | Provider locks the agreed bond |
-| `file_claim(evidence_urls_json)` | write | Client files a claim; triggers AI consensus with strict timing/impact/quorum validation |
-| `dispute_claim(evidence_urls_json)` | write | Provider contests claim within dispute period; invalid/unavailable evidence triggers inconclusive retry |
-| `finalize_claim()` | write | Executes payout only after dispute period has elapsed (or dispute resolved) |
-| `withdraw_remaining_bond()` | write | Provider withdraws after SLA period ends |
-| `get_state()` | view | Mutable status: state, parties, bond, pending claim, history |
-| `get_config()` | view | Static terms: bond amount, period, dispute_period_seconds, evidence domains, penalty tiers |
+| `file_claim(evidence_urls_json)` | write, payable | Client files a claim with anti-spam stake; triggers AI consensus with strict timing/impact/quorum validation within the post-SLA claim window |
+| `dispute_claim(evidence_urls_json)` | write | Provider contests claim within challenge deadline; invalid/unavailable evidence triggers inconclusive retry |
+| `finalize_claim()` | write | Executes payout only after dispute period has elapsed (or dispute resolved); slashes stake on dismissed dispute |
+| `withdraw_remaining_bond()` | write | Provider withdraws after SLA period AND post-SLA claim window have ended |
+| `get_state()` | view | Mutable status: state, parties, bond, claim_stake, pending claim, history |
+| `get_config()` | view | Static terms: bond amount, period, post-SLA claim window, dispute_period_seconds, evidence domains, penalty tiers |
 
 ## Known limitations
 
@@ -86,15 +86,17 @@ not report an incident there.
 
 ```bash
 pip install genlayer-test pytest
-gltest tests/test_nexus_sla.py
+gltest test_nexus_sla.py
 ```
 
-30 tests covering:
-- Constructor validation (including dispute period)
+45+ tests covering:
+- Constructor validation (including dispute period, nonnegative bounds, and tier arrays)
 - Access controls and duplicate deposit prevention
 - Evidence URL validation (quorum, spoofed domains, duplicate domains)
-- Strict incident timing validation (ordering, SLA bounds, future timestamp prevention)
+- Anti-spam client stake and slashing mechanisms
+- Prompt injection sanitization filters
+- Coherent filing rules, incident timing bounds, and post-SLA claim window enforcement
 - Strict impact level and agreeing-source count validation (under-quorum dismissal without penalty)
-- Time-based dispute period enforcement (premature finalization rejection, post-deadline settlement)
-- Inconclusive dispute evidence retry paths (network/render failure, inconclusive verdict retry without locking bond)
-- Payout math with bond capping, incident deduplication, and withdrawal rules.
+- Real time-based dispute challenge deadlines (premature finalization rejection, post-deadline settlement)
+- Inconclusive dispute evidence retry paths and dispute stake slashing
+- Payout math with bond capping, non-negative bounded tiers, and post-SLA withdrawal rules.

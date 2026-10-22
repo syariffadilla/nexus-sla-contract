@@ -1,11 +1,14 @@
-# v2.0.0-enterprise - NexusSLA (Multi-Source Truth Oracle with Anti-Spam Stake & AI Defense)
+# v2.1.0-enterprise - NexusSLA (Multi-Source Truth Oracle with Anti-Spam Stake & AI Defense)
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 """
-NexusSLA v2 Enterprise:
+NexusSLA v2.1 Enterprise:
 - Anti-spam client stake mechanism (slashing frivolous/false claims to provider)
 - Indirect prompt injection sanitization for external web evidence
 - Timestamp bucketing for deterministic LLM validator consensus
 - Enforceable dispute periods with inconclusive retry semantics
+- Strict post-SLA claim-window and coherent filing/withdrawal bounds
+- Rigorous adjudication JSON schema, ordering, and quorum validation
+- Deterministic tier array validation (length, ordering, and nonnegative bounded values)
 """
 
 from genlayer import *
@@ -28,6 +31,7 @@ class NexusSLA(gl.Contract):
     tier_thresholds_json: str
     tier_penalties_json: str
     dispute_period_seconds: u256
+    post_sla_claim_window_seconds: u256
     claims_history_json: str
     pending_claim_json: str
 
@@ -44,6 +48,7 @@ class NexusSLA(gl.Contract):
         tier_penalty_json: str,
         dispute_period_seconds: int = 86400,
         claim_stake_amount: int = 50_000_000_000_000_000,  # 0.05 GEN default anti-spam stake
+        post_sla_claim_window_seconds: int = 86400,  # 24 hours post-SLA claim window
     ):
         provider_addr = Address(provider)
         client_addr = Address(client)
@@ -52,10 +57,35 @@ class NexusSLA(gl.Contract):
         assert claim_stake_amount >= 0, "claim_stake_amount tidak boleh negatif"
         assert end > start, "end harus setelah start"
         assert dispute_period_seconds > 0, "dispute_period_seconds harus positif"
+        assert post_sla_claim_window_seconds >= 0, "post_sla_claim_window_seconds tidak boleh negatif"
 
         domains = json.loads(evidence_domains_json)
         assert len(domains) >= 1, "Minimal 1 domain bukti terdaftar"
         assert 1 <= quorum_required <= len(domains), "quorum_required tidak valid"
+
+        # Steward Requirement 4: Validates tier-array lengths, ordering, and nonnegative bounded threshold/penalty values
+        try:
+            thresholds = json.loads(tier_uptime_thresholds_json)
+            penalties = json.loads(tier_penalty_json)
+        except Exception:
+            raise Exception("tier thresholds dan penalties harus berupa valid JSON array")
+
+        assert isinstance(thresholds, list) and isinstance(penalties, list), "tier arrays harus berupa JSON list"
+        assert len(thresholds) >= 1, "Minimal 1 tier threshold dan penalty harus disediakan"
+        assert len(thresholds) == len(penalties), "Panjang tier thresholds dan penalties harus sama"
+
+        for i in range(len(thresholds)):
+            t = thresholds[i]
+            p = penalties[i]
+            assert isinstance(t, int) and not isinstance(t, bool), f"Threshold pada index {i} harus integer"
+            assert isinstance(p, int) and not isinstance(p, bool), f"Penalty pada index {i} harus integer"
+            assert 0 <= t <= 10000, f"Threshold {t} di luar rentang valid [0, 10000] bps"
+            assert 0 <= p <= 10000, f"Penalty {p} di luar rentang valid [0, 10000] bps"
+
+            if i > 0:
+                # Monotonic ordering: descending uptime threshold, ascending penalty
+                assert t < thresholds[i - 1], "Tier thresholds harus terurut menurun secara ketat"
+                assert p > penalties[i - 1], "Tier penalties harus terurut meningkat secara ketat"
 
         self.provider = provider_addr
         self.client = client_addr
@@ -71,6 +101,7 @@ class NexusSLA(gl.Contract):
         self.tier_thresholds_json = tier_uptime_thresholds_json
         self.tier_penalties_json = tier_penalty_json
         self.dispute_period_seconds = u256(dispute_period_seconds)
+        self.post_sla_claim_window_seconds = u256(post_sla_claim_window_seconds)
         self.claims_history_json = "[]"
         self.pending_claim_json = "{}"
 
@@ -164,12 +195,13 @@ class NexusSLA(gl.Contract):
     def _compute_penalty_bps(self, downtime_minutes: int, period_seconds: int) -> int:
         total_minutes = max(1, period_seconds // 60)
         downtime_bps = min(10000, (downtime_minutes * 10000) // total_minutes)
-        uptime_bps = 10000 - downtime_bps
+        uptime_bps = max(0, 10000 - downtime_bps)
         thresholds = json.loads(self.tier_thresholds_json)
         penalties = json.loads(self.tier_penalties_json)
-        for i in range(len(thresholds)):
+        # Check from lowest uptime / highest penalty tier upwards (reversed for strictly descending thresholds)
+        for i in reversed(range(len(thresholds))):
             if uptime_bps <= int(thresholds[i]):
-                return int(penalties[i])
+                return max(0, min(10000, int(penalties[i])))
         return 0
 
     def _transfer_native(self, to: Address, amount: int) -> None:
@@ -201,6 +233,17 @@ class NexusSLA(gl.Contract):
         if self.state != "ACTIVE":
             raise Exception("Kontrak tidak dalam status ACTIVE")
 
+        current_time = int(gl.block.timestamp)
+        local_start = int(self.start)
+        local_end = int(self.end)
+        max_filing_time = local_end + int(self.post_sla_claim_window_seconds)
+
+        # Steward Requirement 2: Enforce coherent filing rules
+        if current_time < local_start:
+            raise Exception("Klaim tidak dapat diajukan sebelum periode SLA dimulai")
+        if current_time > max_filing_time:
+            raise Exception("Batas waktu pengajuan klaim (termasuk post-SLA claim window) telah berakhir")
+
         # Anti-spam economic gate: Client must deposit claim stake
         stake_required = int(self.claim_stake_amount)
         if stake_required > 0:
@@ -212,8 +255,6 @@ class NexusSLA(gl.Contract):
         local_quorum = int(self.quorum_required)
         local_total_sources = len(urls)
         local_urls = [str(u) for u in urls]
-        local_start = int(self.start)
-        local_end = int(self.end)
 
         def check_incident() -> str:
             contents = []
@@ -282,10 +323,32 @@ Respond ONLY with valid JSON (no markdown):
             "start_time_unix and end_time_unix (bucketed integers), "
             "impact level, and sources_agreeing (same integer count).",
         )
-        parsed = json.loads(raw)
+
+        # Steward Requirement 3: Validates adjudication JSON before state or funds are affected
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            raise Exception("Adjudication JSON tidak valid")
+
+        if not isinstance(parsed, dict):
+            raise Exception("Adjudication JSON harus berupa dictionary")
+
+        consensus_reached = parsed.get("consensus_reached")
+        if not isinstance(consensus_reached, bool):
+            raise Exception("Field consensus_reached harus bertipe boolean")
+
+        incident_id = str(parsed.get("incident_id", "")).strip()
+        try:
+            incident_start = int(parsed.get("start_time_unix", 0))
+            incident_end = int(parsed.get("end_time_unix", 0))
+            sources_agreeing = int(parsed.get("sources_agreeing", 0))
+        except (TypeError, ValueError):
+            raise Exception("Format angka timestamp atau sumber agreeing tidak valid")
+
+        impact = str(parsed.get("impact", "")).lower().strip()
 
         # KASUS A: BUKTI TIDAK VALID / TIDAK ADA INSIDEN (SPAM / FRIVOLOUS CLAIM)
-        if not parsed.get("consensus_reached", False):
+        if not consensus_reached:
             history = json.loads(self.claims_history_json)
             history.append({
                 "status": "DISMISSED",
@@ -300,14 +363,7 @@ Respond ONLY with valid JSON (no markdown):
                 self._transfer_native(self.provider, stake_required)
             return
 
-        # KASUS B: BUKTI VALID
-        incident_id = str(parsed.get("incident_id", "")).strip()
-        incident_start = int(parsed.get("start_time_unix", 0))
-        incident_end = int(parsed.get("end_time_unix", 0))
-        impact = str(parsed.get("impact", "")).lower().strip()
-        sources_agreeing = int(parsed.get("sources_agreeing", 0))
-        current_time = int(gl.block.timestamp)
-
+        # KASUS B: BUKTI VALID - Validasi adjudication JSON secara ketat SEBELUM state/dana diubah
         if not incident_id:
             raise Exception("Incident ID tidak boleh kosong")
 
@@ -316,7 +372,7 @@ Respond ONLY with valid JSON (no markdown):
             if c.get("incident_id") == incident_id:
                 raise Exception("Incident ID ini sudah pernah diproses sebelumnya")
 
-        # Validasi batas waktu insiden
+        # Steward Requirement 2 & 3: Validasi batas waktu insiden & ordering
         if incident_start > incident_end:
             raise Exception("Waktu mulai insiden tidak boleh setelah waktu selesai")
         if incident_start < local_start:
@@ -325,11 +381,13 @@ Respond ONLY with valid JSON (no markdown):
             raise Exception("Waktu insiden setelah periode SLA berakhir")
         if incident_start > current_time:
             raise Exception("Waktu insiden tidak boleh di masa depan")
+        if incident_end > current_time:
+            raise Exception("Waktu selesai insiden tidak boleh di masa depan")
 
         if impact not in ("major", "minor"):
             raise Exception("Level impact tidak valid")
 
-        # Validasi kuorum
+        # Steward Requirement 3: Validasi kuorum sumber
         if sources_agreeing < local_quorum or sources_agreeing > local_total_sources:
             history.append({
                 "status": "DISMISSED",
@@ -346,7 +404,8 @@ Respond ONLY with valid JSON (no markdown):
         duration_minutes = max(1, (incident_end - incident_start) // 60)
         penalty_bps = self._compute_penalty_bps(duration_minutes, local_end - local_start)
         remaining_int = int(self.remaining_bond)
-        payout = min(remaining_int, (remaining_int * penalty_bps) // 10000)
+        # Steward Requirement 4: Bounded nonnegative payout so terms cannot increase recorded bond
+        payout = min(remaining_int, max(0, (remaining_int * penalty_bps) // 10000))
 
         claim_filed_at = current_time
         dispute_deadline = claim_filed_at + int(self.dispute_period_seconds)
@@ -364,6 +423,7 @@ Respond ONLY with valid JSON (no markdown):
             "sources_agreeing": sources_agreeing,
             "client_stake_held": stake_required,
             "disputed": False,
+            "status": "PENDING",
             "finalized": False,
         }
         self.pending_claim_json = json.dumps(pending_data)
@@ -473,34 +533,54 @@ Respond ONLY with valid JSON:
             "Validators must agree EXACTLY on whether status is UPHELD, DISMISSED, "
             "or INCONCLUSIVE, upheld (true/false), revised_impact, and sources_agreeing.",
         )
-        parsed = json.loads(raw)
+
+        # Steward Requirement 3: Validasi adjudication JSON dispute sebelum state terpengaruh
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            raise Exception("Adjudication JSON dispute tidak valid")
+
+        if not isinstance(parsed, dict):
+            raise Exception("Adjudication JSON dispute harus berupa dictionary")
 
         status = str(parsed.get("status", "INCONCLUSIVE")).upper().strip()
         if status == "INCONCLUSIVE" or not parsed.get("status"):
             raise Exception("Bukti dispute tidak tersedia atau tidak konklusif; silakan coba lagi")
 
-        revised_impact = str(parsed.get("revised_impact", "none")).lower().strip()
-        sources_agreeing = int(parsed.get("sources_agreeing", 0))
+        if status not in ("UPHELD", "DISMISSED"):
+            raise Exception(f"Status dispute tidak valid: {status}")
 
-        if revised_impact not in ("major", "minor", "none"):
-            raise Exception("Level revised_impact tidak valid")
+        upheld = parsed.get("upheld")
+        if not isinstance(upheld, bool):
+            raise Exception("Field upheld harus bertipe boolean")
+
+        revised_impact = str(parsed.get("revised_impact", "none")).lower().strip()
+        try:
+            sources_agreeing = int(parsed.get("sources_agreeing", 0))
+        except (TypeError, ValueError):
+            raise Exception("Format angka sources_agreeing tidak valid")
 
         if sources_agreeing < 0 or sources_agreeing > local_total_sources:
             raise Exception("Jumlah sumber yang setuju tidak valid")
 
+        if revised_impact not in ("major", "minor", "none"):
+            raise Exception("Level revised_impact tidak valid")
+
+        if sources_agreeing < local_quorum:
+            raise Exception("Kuorum sumber dispute tidak terpenuhi")
+
         if status == "DISMISSED":
-            if sources_agreeing < local_quorum:
-                raise Exception("Kuorum sumber dispute tidak terpenuhi")
             claim["disputed"] = True
+            claim["status"] = "DISMISSED"
             claim["impact"] = "none"
             claim["sources_agreeing"] = sources_agreeing
             claim["penalty_bps"] = 0
             claim["payout_amount"] = 0
         elif status == "UPHELD":
-            if sources_agreeing < local_quorum:
-                raise Exception("Kuorum sumber dispute tidak terpenuhi")
             claim["disputed"] = True
-            claim["impact"] = revised_impact if revised_impact != "none" else original_impact
+            claim["status"] = "UPHELD"
+            effective_impact = revised_impact if revised_impact != "none" else original_impact
+            claim["impact"] = effective_impact
             claim["sources_agreeing"] = sources_agreeing
 
         self.pending_claim_json = json.dumps(claim)
@@ -516,11 +596,13 @@ Respond ONLY with valid JSON:
         filed_at = int(claim.get("filed_at", 0))
         dispute_deadline = filed_at + int(self.dispute_period_seconds)
 
+        # Steward Requirement 1: Enforces real provider challenge deadline before claim can be finalized
         if not claim.get("disputed", False):
             if current_time < dispute_deadline:
                 raise Exception("Periode dispute belum berakhir")
 
         payout = min(int(claim.get("payout_amount", 0)), int(self.remaining_bond))
+        payout = max(0, payout)
         stake_held = int(claim.get("client_stake_held", 0))
 
         self.remaining_bond = u256(int(self.remaining_bond) - payout)
@@ -533,10 +615,16 @@ Respond ONLY with valid JSON:
         self.pending_claim_json = "{}"
         self.state = "ACTIVE"
 
-        # Transfer payout + kembalikan stake milik klien jika klaim valid
-        total_client_transfer = payout + stake_held
-        if total_client_transfer > 0:
-            self._transfer_native(self.client, total_client_transfer)
+        # Transfer logika adil:
+        # Jika dispute provider menang (DISMISSED): stake klien dislash ke provider
+        if claim.get("disputed", False) and claim.get("status") == "DISMISSED":
+            if stake_held > 0:
+                self._transfer_native(self.provider, stake_held)
+        else:
+            # Klaim sah: kirim payout + kembalikan stake milik klien
+            total_client_transfer = payout + stake_held
+            if total_client_transfer > 0:
+                self._transfer_native(self.client, total_client_transfer)
 
     @gl.public.write
     def withdraw_remaining_bond(self) -> None:
@@ -545,9 +633,14 @@ Respond ONLY with valid JSON:
         if self.state in ("CLAIM_PENDING", "DISPUTE_WINDOW"):
             raise Exception("Tidak bisa withdraw saat klaim pending")
 
-        current_ts = u256(gl.block.timestamp)
-        if current_ts < self.end:
+        current_ts = int(gl.block.timestamp)
+        # Steward Requirement 2: Enforce coherent withdrawal and post-SLA claim-window rules
+        if current_ts < int(self.end):
             raise Exception("Periode SLA belum berakhir")
+
+        min_withdraw_time = int(self.end) + int(self.post_sla_claim_window_seconds)
+        if current_ts < min_withdraw_time:
+            raise Exception("Periode post-SLA claim window belum berakhir")
 
         amount = int(self.remaining_bond)
         self.remaining_bond = u256(0)
@@ -567,6 +660,7 @@ Respond ONLY with valid JSON:
             "claim_stake_amount": int(self.claim_stake_amount),
             "start": int(self.start),
             "end": int(self.end),
+            "post_sla_claim_window_seconds": int(self.post_sla_claim_window_seconds),
             "dispute_period_seconds": int(self.dispute_period_seconds),
             "evidence_domains": json.loads(self.evidence_domains_json),
             "tier_uptime_thresholds_bps": json.loads(self.tier_thresholds_json),
@@ -582,6 +676,7 @@ Respond ONLY with valid JSON:
             "remaining_bond": int(self.remaining_bond),
             "claim_stake_amount": int(self.claim_stake_amount),
             "quorum_required": int(self.quorum_required),
+            "post_sla_claim_window_seconds": int(self.post_sla_claim_window_seconds),
             "pending_claim": json.loads(self.pending_claim_json),
             "history": json.loads(self.claims_history_json),
         })
