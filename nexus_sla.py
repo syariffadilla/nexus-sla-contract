@@ -31,7 +31,7 @@ class NexusSLA(gl.Contract):
     tier_thresholds_json: str
     tier_penalties_json: str
     dispute_period_seconds: u256
-    post_sla_claim_window_seconds: u256
+    claim_window_seconds: u256
     claims_history_json: str
     pending_claim_json: str
 
@@ -53,7 +53,6 @@ class NexusSLA(gl.Contract):
         client_addr = Address(client)
         assert provider_addr != client_addr, "Provider dan client harus berbeda"
         assert bond_amount > 0, "Bond amount harus positif"
-        assert claim_stake_amount >= 0, "claim_stake_amount tidak boleh negatif"
         assert end > start, "end harus setelah start"
         assert dispute_period_seconds > 0, "dispute_period_seconds harus positif"
         assert claim_window_seconds > 0, "claim_window_seconds harus positif"
@@ -71,7 +70,7 @@ class NexusSLA(gl.Contract):
         self.start = u256(start)
         self.end = u256(end)
         self.bond_amount = u256(bond_amount)
-        self.claim_stake_amount = u256(claim_stake_amount)
+        self.claim_stake_amount = u256(0)
         self.bond_deposited = False
         self.remaining_bond = u256(0)
         self.state = "UNINITIALIZED"
@@ -631,10 +630,6 @@ Respond ONLY with valid JSON:
         if current_ts <= int(self.end) + int(self.claim_window_seconds):
             raise Exception("Claim window belum berakhir")
 
-        min_withdraw_time = int(self.end) + int(self.post_sla_claim_window_seconds)
-        if current_ts < min_withdraw_time:
-            raise Exception("Periode post-SLA claim window belum berakhir")
-
         amount = int(self.remaining_bond)
         self.remaining_bond = u256(0)
         self.state = "CLOSED"
@@ -653,9 +648,8 @@ Respond ONLY with valid JSON:
             "claim_stake_amount": int(self.claim_stake_amount),
             "start": int(self.start),
             "end": int(self.end),
-            "post_sla_claim_window_seconds": int(self.post_sla_claim_window_seconds),
-            "dispute_period_seconds": int(self.dispute_period_seconds),
             "claim_window_seconds": int(self.claim_window_seconds),
+            "dispute_period_seconds": int(self.dispute_period_seconds),
             "evidence_domains": json.loads(self.evidence_domains_json),
             "tier_uptime_thresholds_bps": json.loads(self.tier_thresholds_json),
             "tier_penalty_bps": json.loads(self.tier_penalties_json),
@@ -670,7 +664,7 @@ Respond ONLY with valid JSON:
             "remaining_bond": int(self.remaining_bond),
             "claim_stake_amount": int(self.claim_stake_amount),
             "quorum_required": int(self.quorum_required),
-            "post_sla_claim_window_seconds": int(self.post_sla_claim_window_seconds),
+            "claim_window_seconds": int(self.claim_window_seconds),
             "pending_claim": json.loads(self.pending_claim_json),
             "history": json.loads(self.claims_history_json),
         })
